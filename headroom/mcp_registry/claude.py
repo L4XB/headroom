@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,30 @@ logger = logging.getLogger(__name__)
 
 class ClaudeConfigMutationError(ValueError):
     """Raised when a Claude config cannot be safely changed."""
+
+
+@dataclass(frozen=True)
+class PluginServer:
+    """An MCP server a Claude Code *plugin* contributes.
+
+    These never appear in ``mcpServers``: Claude Code reads them from the
+    plugin's own ``.mcp.json`` and lists them as ``plugin:<plugin>:<server>``.
+    So a plugin shipping a server Headroom also registers gives the user two
+    of them running side by side, and every ``mcpServers``-based check --
+    :meth:`ClaudeRegistrar.get_server`, and therefore ``mcp reconcile`` --
+    reports the Headroom entry as consistent while missing the second one
+    entirely.
+    """
+
+    plugin: str
+    """The ``<plugin>@<marketplace>`` key, as ``claude plugin`` spells it."""
+    spec: ServerSpec
+    source: Path
+    """The ``.mcp.json`` it was read from, so a report can point at it."""
+
+    @property
+    def disable_command(self) -> str:
+        return f"claude plugin disable {self.plugin}"
 
 
 class ClaudeRegistrar(MCPRegistrar):
@@ -87,6 +112,52 @@ class ClaudeRegistrar(MCPRegistrar):
             if entry is not None:
                 return entry
         return None
+
+    def get_plugin_servers(self, server_name: str) -> list[PluginServer]:
+        """Every installed plugin that contributes an MCP server of this name.
+
+        Read-only and non-mutating by design: a plugin belongs to whoever
+        installed it, so the most Headroom should do is say that it is there
+        and how to turn it off.
+
+        Installed plugins are listed in ``~/.claude/plugins/installed_plugins.json``
+        (``{"plugins": {"<plugin>@<marketplace>": [{"installPath": ...}]}}``),
+        and each install carries its own ``.mcp.json``. A plugin that ships no
+        MCP server simply has no such file.
+        """
+        registry = _read_json(self._claude_dir / "plugins" / "installed_plugins.json")
+        plugins = registry.get("plugins")
+        if not isinstance(plugins, dict):
+            return []
+
+        found: list[PluginServer] = []
+        seen: set[Path] = set()
+        for plugin_key, installs in plugins.items():
+            if not isinstance(installs, list):
+                continue
+            for install in installs:
+                if not isinstance(install, dict):
+                    continue
+                install_path = install.get("installPath")
+                if not isinstance(install_path, str) or not install_path:
+                    continue
+                manifest = Path(install_path) / ".mcp.json"
+                # The same plugin can be installed at user and project scope
+                # from one path; report the server once, not once per scope.
+                if manifest in seen:
+                    continue
+                seen.add(manifest)
+                entry = _read_json(manifest).get(server_name)
+                if not isinstance(entry, dict):
+                    continue
+                found.append(
+                    PluginServer(
+                        plugin=str(plugin_key),
+                        spec=_entry_to_spec(server_name, entry),
+                        source=manifest,
+                    )
+                )
+        return found
 
     def validate_configs_for_mutation(self) -> None:
         """Validate every Claude config root before an explicit mutation."""

@@ -5,13 +5,18 @@ Claude Code subscription users to use CCR (Compress-Cache-Retrieve) without
 needing API key access.
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
 from .main import main
+
+if TYPE_CHECKING:
+    from headroom.mcp_registry import ClaudeRegistrar
 
 # Default paths
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
@@ -216,6 +221,24 @@ def mcp_uninstall() -> None:
         click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 
 
+def _echo_plugin_serena_warning(registrar: ClaudeRegistrar, indent: str = "  ") -> bool:
+    """Report a plugin-provided Serena, if one is installed.
+
+    Reporting only. A plugin belongs to whoever installed it, and removing a
+    third-party plugin's config is not Headroom's call to make -- so this
+    prints the command and stops there.
+    """
+    plugin_servers = registrar.get_plugin_servers("serena")
+    if not plugin_servers:
+        return False
+    for found in plugin_servers:
+        click.echo(f"{indent}warning: plugin {found.plugin} also provides a Serena MCP server")
+        click.echo(f"{indent}         from {found.source}")
+        click.echo(f"{indent}         Claude Code runs both; Headroom manages only its own entry.")
+        click.echo(f"{indent}         to run one: {found.disable_command}")
+    return True
+
+
 @mcp.command("reconcile")
 @click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
 def mcp_reconcile(adopt: bool) -> None:
@@ -260,6 +283,10 @@ def mcp_reconcile(adopt: bool) -> None:
     click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
     if observed is not None and observed != recommended:
         click.echo("  action: use --adopt to replace it")
+    # A plugin-provided Serena lives in the plugin's own `.mcp.json`, which
+    # `get_server` structurally cannot see -- so without this the line above
+    # says "present" and consistent while a second Serena runs alongside it.
+    _echo_plugin_serena_warning(registrar)
 
 
 @mcp.command("status")
@@ -301,6 +328,14 @@ def mcp_status() -> None:
 
     if not any_configured:
         click.echo("                Run: headroom mcp install")
+
+    # `status` has had no MCP-server checks at all, so a second Serena from a
+    # plugin was invisible here too.
+    from headroom.mcp_registry import ClaudeRegistrar
+
+    claude = ClaudeRegistrar()
+    if claude.detect():
+        _echo_plugin_serena_warning(claude, indent="  ")
     click.echo(f"Proxy URL:      {proxy_url}")
 
     # Check proxy connectivity

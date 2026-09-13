@@ -509,3 +509,149 @@ def test_register_via_file_merges_into_existing_valid_config(tmp_path: Path) -> 
     assert data["projects"] == {"/x": {"y": 1}}
     assert data["oauthAccount"] == {"id": "abc"}
     assert "headroom" in data["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# Plugin-provided MCP servers (#3570)
+# ---------------------------------------------------------------------------
+
+
+def _install_plugin(
+    home: Path,
+    plugin_key: str,
+    servers: dict[str, dict] | None,
+    *,
+    version: str = "1.0.0",
+) -> Path:
+    """Install a plugin the way Claude Code lays one out on disk.
+
+    ``servers=None`` installs a plugin that ships no ``.mcp.json`` at all,
+    which is the common case and must not be mistaken for one that does.
+    """
+    name, _, marketplace = plugin_key.partition("@")
+    install_path = home / ".claude" / "plugins" / "cache" / marketplace / name / version
+    install_path.mkdir(parents=True, exist_ok=True)
+    if servers is not None:
+        (install_path / ".mcp.json").write_text(json.dumps(servers), encoding="utf-8")
+
+    registry_path = home / ".claude" / "plugins" / "installed_plugins.json"
+    registry = (
+        json.loads(registry_path.read_text())
+        if registry_path.exists()
+        else {
+            "version": 2,
+            "plugins": {},
+        }
+    )
+    registry["plugins"].setdefault(plugin_key, []).append(
+        {"scope": "user", "installPath": str(install_path), "version": version}
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    return install_path
+
+
+_PLUGIN_SERENA = {
+    "serena": {
+        "command": "uvx",
+        "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server"],
+    }
+}
+
+
+def test_plugin_provided_server_is_found(tmp_path: Path) -> None:
+    """The whole point: this server is invisible to ``get_server``.
+
+    It lives in the plugin's own ``.mcp.json``, never in ``mcpServers``, so
+    every check built on ``get_server`` reports a clean configuration while a
+    second Serena runs beside Headroom's.
+    """
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    registrar = _make_registrar(tmp_path)
+
+    assert registrar.get_server("serena") is None
+
+    found = registrar.get_plugin_servers("serena")
+    assert len(found) == 1
+    assert found[0].plugin == "serena@claude-plugins-official"
+    assert found[0].spec.command == "uvx"
+    assert "git+https://github.com/oraios/serena" in found[0].spec.args
+    assert found[0].disable_command == "claude plugin disable serena@claude-plugins-official"
+
+
+def test_a_plugin_that_ships_no_mcp_server_is_not_reported(tmp_path: Path) -> None:
+    """Most plugins have no ``.mcp.json``; a missing file is not a finding."""
+    _install_plugin(tmp_path, "gopls-lsp@claude-plugins-official", None)
+    registrar = _make_registrar(tmp_path)
+
+    assert registrar.get_plugin_servers("serena") == []
+
+
+def test_a_plugin_shipping_a_different_server_is_not_reported(tmp_path: Path) -> None:
+    """Name-matched, not plugin-matched: a plugin with some other MCP server
+    is an ordinary installation, not a duplicate Serena."""
+    _install_plugin(tmp_path, "context7@claude-plugins-official", {"context7": {"command": "npx"}})
+    registrar = _make_registrar(tmp_path)
+
+    assert registrar.get_plugin_servers("serena") == []
+
+
+def test_no_plugins_installed_reports_nothing(tmp_path: Path) -> None:
+    registrar = _make_registrar(tmp_path)
+    assert registrar.get_plugin_servers("serena") == []
+
+
+def test_a_malformed_plugin_registry_is_not_fatal(tmp_path: Path) -> None:
+    """A registry Headroom cannot parse is not a reason to fail the command
+    it was only trying to annotate."""
+    registry_path = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text("{not json", encoding="utf-8")
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_malformed_plugin_manifest_is_skipped(tmp_path: Path) -> None:
+    install_path = _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    (install_path / ".mcp.json").write_text("[]", encoding="utf-8")
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_one_plugin_installed_at_two_scopes_is_reported_once(tmp_path: Path) -> None:
+    """Claude records a user-scope and a project-scope install separately, but
+    they can share an install path -- and there is still only one server."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    registry_path = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+    registry = json.loads(registry_path.read_text())
+    entry = dict(registry["plugins"]["serena@claude-plugins-official"][0])
+    entry["scope"] = "project"
+    registry["plugins"]["serena@claude-plugins-official"].append(entry)
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_two_different_plugins_are_both_reported(tmp_path: Path) -> None:
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    _install_plugin(tmp_path, "serena@someone-else", _PLUGIN_SERENA)
+
+    found = _make_registrar(tmp_path).get_plugin_servers("serena")
+    assert sorted(f.plugin for f in found) == [
+        "serena@claude-plugins-official",
+        "serena@someone-else",
+    ]
+
+
+def test_detection_does_not_touch_the_plugin(tmp_path: Path) -> None:
+    """Headroom must not mutate a third-party plugin -- the issue asks for a
+    warning, not a removal."""
+    install_path = _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    manifest = install_path / ".mcp.json"
+    before = manifest.read_bytes()
+    registry_path = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+    registry_before = registry_path.read_bytes()
+
+    _make_registrar(tmp_path).get_plugin_servers("serena")
+
+    assert manifest.read_bytes() == before
+    assert registry_path.read_bytes() == registry_before
