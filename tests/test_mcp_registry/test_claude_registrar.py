@@ -698,14 +698,95 @@ def test_a_wrapped_manifest_of_another_server_is_not_reported(tmp_path: Path) ->
     assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
 
 
-def test_a_project_scope_install_is_not_reported(tmp_path: Path) -> None:
-    """A project-scope record is active in that project alone, and this command
-    is told nothing about which project the user means."""
+def _make_project_scope(home: Path, project_path: Path, scope: str = "local") -> None:
+    """Rewrite the single install record as a project-scope one."""
+    registry_path = home / ".claude" / "plugins" / "installed_plugins.json"
+    registry = json.loads(registry_path.read_text())
+    record = registry["plugins"]["serena@claude-plugins-official"][0]
+    record["scope"] = scope
+    record["projectPath"] = str(project_path)
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+
+def test_a_project_scope_install_is_reported_inside_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude launches it in that project, so staying quiet there is the false
+    negative that matters -- it is exactly where the second Serena runs."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _make_project_scope(tmp_path, project)
+    monkeypatch.chdir(project)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_a_project_scope_install_is_reported_below_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    nested = project / "src" / "deep"
+    nested.mkdir(parents=True)
+    _make_project_scope(tmp_path, project)
+    monkeypatch.chdir(nested)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_a_project_scope_install_is_quiet_outside_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    elsewhere = tmp_path / "work" / "unrelated"
+    elsewhere.mkdir(parents=True)
+    _make_project_scope(tmp_path, project)
+    monkeypatch.chdir(elsewhere)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_sibling_directory_that_shares_a_prefix_is_not_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/work/api-v2` is not inside `/work/api`, however the strings compare."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    sibling = tmp_path / "work" / "api-v2"
+    sibling.mkdir(parents=True)
+    _make_project_scope(tmp_path, project)
+    monkeypatch.chdir(sibling)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_project_scope_install_without_a_path_is_not_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record that cannot be placed must not be spoken for."""
     _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
     registry_path = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
     registry = json.loads(registry_path.read_text())
-    registry["plugins"]["serena@claude-plugins-official"][0]["scope"] = "project"
+    registry["plugins"]["serena@claude-plugins-official"][0]["scope"] = "local"
     registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_disabled_project_scope_install_is_not_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _make_project_scope(tmp_path, project)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", False)
+    monkeypatch.chdir(project)
 
     assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
 

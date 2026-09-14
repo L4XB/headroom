@@ -141,9 +141,10 @@ class ClaudeRegistrar(MCPRegistrar):
         and each install carries its own ``.mcp.json``. A plugin that ships no
         MCP server simply has no such file.
 
-        Only ``user``-scope installs are reported. A project-scope record is
-        active in that project alone, and this command knows nothing about the
-        project the user means.
+        A ``user``-scope record is active everywhere. A project-scope record
+        (``local`` / ``project``, with a ``projectPath``) is active only inside
+        that project, so it is reported only when the working directory is the
+        project or lies within it.
         """
         registry = _read_json(self._claude_dir / "plugins" / "installed_plugins.json")
         plugins = registry.get("plugins")
@@ -160,7 +161,7 @@ class ClaudeRegistrar(MCPRegistrar):
             for install in installs:
                 if not isinstance(install, dict):
                     continue
-                if install.get("scope") != "user":
+                if not _install_is_active_here(install):
                     continue
                 install_path = install.get("installPath")
                 if not isinstance(install_path, str) or not install_path:
@@ -394,6 +395,31 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def _install_is_active_here(install: dict[str, Any]) -> bool:
+    """Whether Claude would launch this install in the current directory.
+
+    A ``user`` record is active everywhere. Every other scope is a project
+    record and carries a ``projectPath``; Claude applies it inside that
+    directory tree, so the working directory has to be the project or below
+    it. A project record without a usable path cannot be placed, and a
+    detector that cannot place a record must not speak for it.
+    """
+    if install.get("scope") == "user":
+        return True
+
+    project_path = install.get("projectPath")
+    if not isinstance(project_path, str) or not project_path:
+        return False
+
+    try:
+        project = Path(project_path).resolve()
+        here = Path.cwd().resolve()
+    except OSError:
+        return False
+
+    return here == project or project in here.parents
 
 
 def _plugin_manifest_servers(manifest: dict[str, Any]) -> dict[str, Any]:
