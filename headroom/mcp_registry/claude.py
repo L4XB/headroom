@@ -113,41 +113,65 @@ class ClaudeRegistrar(MCPRegistrar):
                 return entry
         return None
 
+    def _disabled_plugins(self) -> set[str]:
+        """Plugin keys that ``settings.json`` turns off.
+
+        ``claude plugin disable <key>`` leaves the install record alone and
+        writes ``enabledPlugins[<key>] = false``. A detector that ignores this
+        keeps warning right after the user runs the command it recommended.
+
+        Only an explicit ``false`` counts as off. A plugin with no entry is
+        treated as active, because missing the second server is the worse of
+        the two errors here.
+        """
+        enabled = _read_json(self._claude_dir / "settings.json").get("enabledPlugins")
+        if not isinstance(enabled, dict):
+            return set()
+        return {str(key) for key, value in enabled.items() if value is False}
+
     def get_plugin_servers(self, server_name: str) -> list[PluginServer]:
-        """Every installed plugin that contributes an MCP server of this name.
+        """Every enabled user-scope plugin that gives an MCP server of this name.
 
         Read-only and non-mutating by design: a plugin belongs to whoever
         installed it, so the most Headroom should do is say that it is there
         and how to turn it off.
 
         Installed plugins are listed in ``~/.claude/plugins/installed_plugins.json``
-        (``{"plugins": {"<plugin>@<marketplace>": [{"installPath": ...}]}}``),
+        (``{"plugins": {"<plugin>@<marketplace>": [{"installPath": ..., "scope": ...}]}}``),
         and each install carries its own ``.mcp.json``. A plugin that ships no
         MCP server simply has no such file.
+
+        Only ``user``-scope installs are reported. A project-scope record is
+        active in that project alone, and this command knows nothing about the
+        project the user means.
         """
         registry = _read_json(self._claude_dir / "plugins" / "installed_plugins.json")
         plugins = registry.get("plugins")
         if not isinstance(plugins, dict):
             return []
 
+        disabled = self._disabled_plugins()
+
         found: list[PluginServer] = []
         seen: set[Path] = set()
         for plugin_key, installs in plugins.items():
-            if not isinstance(installs, list):
+            if not isinstance(installs, list) or str(plugin_key) in disabled:
                 continue
             for install in installs:
                 if not isinstance(install, dict):
+                    continue
+                if install.get("scope") != "user":
                     continue
                 install_path = install.get("installPath")
                 if not isinstance(install_path, str) or not install_path:
                     continue
                 manifest = Path(install_path) / ".mcp.json"
-                # The same plugin can be installed at user and project scope
-                # from one path; report the server once, not once per scope.
+                # One plugin can hold several install records over one path;
+                # report the server once, not once per record.
                 if manifest in seen:
                     continue
                 seen.add(manifest)
-                entry = _read_json(manifest).get(server_name)
+                entry = _plugin_manifest_servers(_read_json(manifest)).get(server_name)
                 if not isinstance(entry, dict):
                     continue
                 found.append(
@@ -370,6 +394,20 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def _plugin_manifest_servers(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The server map of a plugin's ``.mcp.json``, whichever shape it uses.
+
+    Both are in the wild. Of the 14 manifests in the ``claude-plugins-official``
+    marketplace, 9 are the flat ``{"<server>": {...}}`` and 5 wrap it as
+    ``{"mcpServers": {"<server>": {...}}}``. Reading only the flat one silently
+    misses the rest.
+    """
+    wrapped = manifest.get("mcpServers")
+    if isinstance(wrapped, dict):
+        return wrapped
+    return manifest
 
 
 class _MalformedConfigError(Exception):

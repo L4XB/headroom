@@ -631,6 +631,85 @@ def test_one_plugin_installed_at_two_scopes_is_reported_once(tmp_path: Path) -> 
     assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
 
 
+def _set_plugin_enabled(home: Path, plugin_key: str, enabled: bool) -> None:
+    """Write what ``claude plugin enable/disable <key>`` writes."""
+    settings_path = home / ".claude" / "settings.json"
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    settings.setdefault("enabledPlugins", {})[plugin_key] = enabled
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+
+def test_a_disabled_plugin_is_not_reported(tmp_path: Path) -> None:
+    """``claude plugin disable`` -- the command this warning recommends -- leaves
+    the install record in place and only flips ``enabledPlugins``. Reporting it
+    anyway would keep warning right after the user did what was asked."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", False)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_an_explicitly_enabled_plugin_is_reported(tmp_path: Path) -> None:
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", True)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_a_plugin_with_no_enabled_entry_is_still_reported(tmp_path: Path) -> None:
+    """Only an explicit ``false`` means off. Staying quiet about a plugin that
+    Claude may well be running is the worse of the two errors for a detector."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    (tmp_path / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"gopls-lsp@claude-plugins-official": True}}),
+        encoding="utf-8",
+    )
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_a_disabled_plugin_does_not_silence_a_different_one(tmp_path: Path) -> None:
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    _install_plugin(tmp_path, "serena@someone-else", _PLUGIN_SERENA)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", False)
+
+    found = _make_registrar(tmp_path).get_plugin_servers("serena")
+    assert [f.plugin for f in found] == ["serena@someone-else"]
+
+
+def test_a_wrapped_manifest_is_read_too(tmp_path: Path) -> None:
+    """Both shapes are in the wild: of the 14 manifests in the
+    ``claude-plugins-official`` marketplace, 9 are flat and 5 wrap the map in
+    ``mcpServers``. Reading only the flat one misses over a third of them."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", {"mcpServers": _PLUGIN_SERENA})
+
+    found = _make_registrar(tmp_path).get_plugin_servers("serena")
+    assert len(found) == 1
+    assert found[0].spec.command == "uvx"
+
+
+def test_a_wrapped_manifest_of_another_server_is_not_reported(tmp_path: Path) -> None:
+    _install_plugin(
+        tmp_path,
+        "gopls-lsp@claude-plugins-official",
+        {"mcpServers": {"gopls": {"command": "gopls"}}},
+    )
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_project_scope_install_is_not_reported(tmp_path: Path) -> None:
+    """A project-scope record is active in that project alone, and this command
+    is told nothing about which project the user means."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    registry_path = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+    registry = json.loads(registry_path.read_text())
+    registry["plugins"]["serena@claude-plugins-official"][0]["scope"] = "project"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
 def test_two_different_plugins_are_both_reported(tmp_path: Path) -> None:
     _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
     _install_plugin(tmp_path, "serena@someone-else", _PLUGIN_SERENA)
