@@ -113,21 +113,36 @@ class ClaudeRegistrar(MCPRegistrar):
                 return entry
         return None
 
-    def _disabled_plugins(self) -> set[str]:
-        """Plugin keys that ``settings.json`` turns off.
+    def _enabled_plugins_for(self, project_path: Path | None) -> dict[str, bool]:
+        """Effective ``enabledPlugins`` for one install in the working directory.
 
         ``claude plugin disable <key>`` leaves the install record alone and
         writes ``enabledPlugins[<key>] = false``. A detector that ignores this
         keeps warning right after the user runs the command it recommended.
 
-        Only an explicit ``false`` counts as off. A plugin with no entry is
-        treated as active, because missing the second server is the worse of
-        the two errors here.
+        Claude resolves that map across three files, most specific last: the
+        user's ``~/.claude/settings.json``, the project's
+        ``<project>/.claude/settings.json`` and the local
+        ``<project>/.claude/settings.local.json``. A more specific value
+        overrides the user one in *both* directions, so reading only the user
+        file warns through a project-local ``false`` and stays quiet on a
+        project-local ``true`` — and when the disable is written into the
+        project, it is the file the remedy touched that never got read.
+
+        The project layers come from the install's own ``projectPath``; the
+        working directory is applied last, being at or below that project
+        (:func:`_install_is_active_here` has already established it) and the
+        most specific place Claude looks.
+
+        Only an explicit ``false`` counts as off. A plugin with no entry
+        anywhere is treated as active, because missing the second server is
+        the worse of the two errors here.
         """
-        enabled = _read_json(self._claude_dir / "settings.json").get("enabledPlugins")
-        if not isinstance(enabled, dict):
-            return set()
-        return {str(key) for key, value in enabled.items() if value is False}
+        effective = _settings_enabled_plugins(self._claude_dir / "settings.json")
+        for directory in (project_path, _cwd_or_none()):
+            if directory is not None:
+                effective.update(_dir_enabled_plugins(directory))
+        return effective
 
     def get_plugin_servers(self, server_name: str) -> list[PluginServer]:
         """Every enabled user-scope plugin that gives an MCP server of this name.
@@ -144,24 +159,29 @@ class ClaudeRegistrar(MCPRegistrar):
         A ``user``-scope record is active everywhere. A project-scope record
         (``local`` / ``project``, with a ``projectPath``) is active only inside
         that project, so it is reported only when the working directory is the
-        project or lies within it.
+        project or lies within it. Either way the plugin also has to be enabled
+        for that directory (see :meth:`_enabled_plugins_for`).
         """
         registry = _read_json(self._claude_dir / "plugins" / "installed_plugins.json")
         plugins = registry.get("plugins")
         if not isinstance(plugins, dict):
             return []
 
-        disabled = self._disabled_plugins()
-
         found: list[PluginServer] = []
         seen: set[Path] = set()
         for plugin_key, installs in plugins.items():
-            if not isinstance(installs, list) or str(plugin_key) in disabled:
+            if not isinstance(installs, list):
                 continue
             for install in installs:
                 if not isinstance(install, dict):
                     continue
                 if not _install_is_active_here(install):
+                    continue
+                # Enabled state is resolved per record, not per plugin: the
+                # project layers that can override the user value are the ones
+                # belonging to this install's own project.
+                enabled = self._enabled_plugins_for(_install_project_path(install))
+                if enabled.get(str(plugin_key)) is False:
                     continue
                 install_path = install.get("installPath")
                 if not isinstance(install_path, str) or not install_path:
@@ -397,6 +417,60 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _cwd_or_none() -> Path | None:
+    """The resolved working directory, or ``None`` if it cannot be read.
+
+    A deleted cwd raises from :meth:`Path.cwd`; degrade to "cannot place it"
+    rather than failing the command this only annotates.
+    """
+    try:
+        return Path.cwd().resolve()
+    except OSError:
+        return None
+
+
+def _settings_enabled_plugins(path: Path) -> dict[str, bool]:
+    """The ``enabledPlugins`` booleans of one Claude settings file.
+
+    Non-boolean values are dropped rather than coerced: Claude writes ``true``
+    / ``false``, and guessing at anything else would silence a plugin on a
+    typo.
+    """
+    enabled = _read_json(path).get("enabledPlugins")
+    if not isinstance(enabled, dict):
+        return {}
+    return {str(key): value for key, value in enabled.items() if isinstance(value, bool)}
+
+
+def _dir_enabled_plugins(directory: Path) -> dict[str, bool]:
+    """``enabledPlugins`` from one directory's Claude settings.
+
+    ``settings.local.json`` is applied after ``settings.json``: local scope is
+    the more specific of the two and wins where both name a plugin.
+    """
+    settings_dir = directory / ".claude"
+    merged = _settings_enabled_plugins(settings_dir / "settings.json")
+    merged.update(_settings_enabled_plugins(settings_dir / "settings.local.json"))
+    return merged
+
+
+def _install_project_path(install: dict[str, Any]) -> Path | None:
+    """The resolved project directory of a project-scope install record.
+
+    ``None`` for a ``user`` record, which belongs to no project, and for a
+    project record whose ``projectPath`` is missing or unusable.
+    """
+    if install.get("scope") == "user":
+        return None
+    project_path = install.get("projectPath")
+    if not isinstance(project_path, str) or not project_path:
+        return None
+    try:
+        return Path(project_path).resolve()
+    except OSError:
+        return None
+
+
 def _install_is_active_here(install: dict[str, Any]) -> bool:
     """Whether Claude would launch this install in the current directory.
 
@@ -409,14 +483,9 @@ def _install_is_active_here(install: dict[str, Any]) -> bool:
     if install.get("scope") == "user":
         return True
 
-    project_path = install.get("projectPath")
-    if not isinstance(project_path, str) or not project_path:
-        return False
-
-    try:
-        project = Path(project_path).resolve()
-        here = Path.cwd().resolve()
-    except OSError:
+    project = _install_project_path(install)
+    here = _cwd_or_none()
+    if project is None or here is None:
         return False
 
     return here == project or project in here.parents

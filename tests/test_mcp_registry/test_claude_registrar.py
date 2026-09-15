@@ -815,3 +815,161 @@ def test_detection_does_not_touch_the_plugin(tmp_path: Path) -> None:
 
     assert manifest.read_bytes() == before
     assert registry_path.read_bytes() == registry_before
+
+
+def _set_dir_plugin_enabled(
+    directory: Path, plugin_key: str, enabled: bool, *, local: bool = False
+) -> None:
+    """Write what ``claude plugin enable/disable`` writes inside a project.
+
+    ``local=True`` targets ``settings.local.json`` -- the local scope Claude
+    keeps out of version control -- instead of the shared ``settings.json``.
+    """
+    settings_dir = directory / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    name = "settings.local.json" if local else "settings.json"
+    settings_path = settings_dir / name
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    settings.setdefault("enabledPlugins", {})[plugin_key] = enabled
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+
+def _project_scope_install(tmp_path: Path, project: Path) -> None:
+    """One project-scope Serena install rooted at ``project``."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    _make_project_scope(tmp_path, project)
+
+
+def test_a_project_false_overrides_a_user_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The more specific file wins. Reading only the user settings warns right
+    through a disable the user ran inside the project."""
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", True)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", False)
+    monkeypatch.chdir(project)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_local_false_overrides_a_user_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", True)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", False, local=True)
+    monkeypatch.chdir(project)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_project_true_overrides_a_user_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other direction: turned off globally, back on in this project, so
+    Claude launches it here and the duplicate is real."""
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", False)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", True)
+    monkeypatch.chdir(project)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_a_local_true_overrides_a_user_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    _set_plugin_enabled(tmp_path, "serena@claude-plugins-official", False)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", True, local=True)
+    monkeypatch.chdir(project)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_local_settings_override_project_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Within one directory, ``settings.local.json`` is the more specific of
+    the two."""
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", True)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", False, local=True)
+    monkeypatch.chdir(project)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_project_disable_applies_below_the_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The layer belongs to the record's own project, not to the working
+    directory alone -- running from a subdirectory must not resurrect it."""
+    project = tmp_path / "work" / "api"
+    nested = project / "src" / "deep"
+    nested.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", False)
+    monkeypatch.chdir(nested)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_project_setting_does_not_apply_outside_that_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user-scope install stays reported elsewhere, whatever some unrelated
+    project's settings say about it."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    elsewhere = tmp_path / "work" / "unrelated"
+    elsewhere.mkdir(parents=True)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", False)
+    monkeypatch.chdir(elsewhere)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
+
+
+def test_a_cwd_disable_silences_a_user_scope_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user-scope plugin turned off in this project is not launched here."""
+    _install_plugin(tmp_path, "serena@claude-plugins-official", _PLUGIN_SERENA)
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _set_dir_plugin_enabled(project, "serena@claude-plugins-official", False)
+    monkeypatch.chdir(project)
+
+    assert _make_registrar(tmp_path).get_plugin_servers("serena") == []
+
+
+def test_a_non_boolean_enabled_value_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude writes booleans; anything else is not a disable, and silencing a
+    duplicate on a typo is the worse of the two errors. ``0`` is the case that
+    separates dropping the value from coercing it -- ``bool(0)`` is ``False``,
+    which would read as a disable nobody wrote."""
+    project = tmp_path / "work" / "api"
+    project.mkdir(parents=True)
+    _project_scope_install(tmp_path, project)
+    (project / ".claude").mkdir(parents=True, exist_ok=True)
+    (project / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"serena@claude-plugins-official": 0}}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    assert len(_make_registrar(tmp_path).get_plugin_servers("serena")) == 1
