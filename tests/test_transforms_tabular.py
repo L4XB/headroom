@@ -421,6 +421,37 @@ def test_load_xls_renders_cells_like_the_xlsx_loader(tmp_path) -> None:
     assert rows[1] == "2024-01-01 00:00:00,True,12,1.5,ok"
 
 
+def test_load_xls_renders_a_time_only_cell_as_a_time(tmp_path) -> None:
+    """A time carries no date, so xlrd reports year, month and day as zero."""
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    time_style = xlwt.XFStyle()
+    time_style.num_format_str = "HH:MM:SS"
+
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    sheet.write(0, 0, "Starts")
+    sheet.write(1, 0, datetime.time(12, 0, 0), time_style)
+    xls_path = tmp_path / "legacy.xls"
+    book.save(xls_path)
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["Starts"])
+    worksheet.append([datetime.time(12, 0, 0)])
+    xlsx_path = tmp_path / "modern.xlsx"
+    workbook.save(xlsx_path)
+
+    # ValueError: year 0 is out of range before this.
+    assert load_spreadsheet(xls_path)["Data"] == load_spreadsheet(xlsx_path)["Data"]
+    assert load_spreadsheet(xls_path)["Data"].splitlines()[1] == "12:00:00"
+
+
 def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
     """The reference: openpyxl is what the .xls path is matching."""
     xlwt = pytest.importorskip("xlwt")
